@@ -1,0 +1,35 @@
+import streamlit as st
+import pandas as pd
+from datetime import date
+
+st.set_page_config(page_title="My Trading App", layout="wide")
+
+st.title("My Personal Trading App")
+
+st.write("This is my first working trading app.")
+
+st.header("Add a Trade")
+
+with st.form("trade_form"):
+    trade_date = st.date_input("Trade Date", value=date.today())
+    symbol = st.text_input("Ticker Symbol (ex: AAPL)")
+    strategy = st.selectbox(
+        "Strategy",
+        ["Call", "Put", "Credit Spread", "Calendar", "Diagonal", "Butterfly"]
+    )
+    pnl = st.number_input("Profit / Loss ($)", value=0.0)
+    submitted = st.form_submit_button("Save Trade")
+
+    if submitted:
+        st.success("Trade saved (demo only).")
+
+st.divider()
+
+st.header("What this app will become")
+st.write("""
+• Trade journal  
+• Strategy recommendations  
+• Option analytics  
+• Risk guardrails  
+• Backtesting  
+""")
