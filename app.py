@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 from datetime import date, timedelta
 from pathlib import Path
 
+# local parser
+from tos import parse_tos_csv
+
 # ---------------- CONFIG & DIRECTORIES ----------------
 DB_PATH = Path("trades.db")
 UPLOAD_DIR = Path("uploads")
@@ -64,8 +67,8 @@ def init_db():
                     'quality INTEGER'
                 ])}
             )
-        """
-        )
+        """)
+
 
 def save_trade(trade, edit=False):
     """
@@ -73,7 +76,6 @@ def save_trade(trade, edit=False):
     """
     with get_conn() as conn:
         if edit:
-            # build SET clause and parameters in the canonical order (excluding id)
             cols_no_id = TRADE_COLUMNS[1:]
             set_clause = ", ".join([f"{c}=?" for c in cols_no_id])
             params = tuple(trade.get(c) for c in cols_no_id) + (trade["id"],)
@@ -83,6 +85,7 @@ def save_trade(trade, edit=False):
             params = tuple(trade.get(c) for c in TRADE_COLUMNS)
             conn.execute(f"INSERT INTO trades VALUES ({placeholders})", params)
 
+
 def bulk_save_trades(trades_list):
     """
     trades_list: iterable of tuples/lists already in the TRADE_COLUMNS order (length must match)
@@ -90,6 +93,14 @@ def bulk_save_trades(trades_list):
     placeholders = ",".join(["?" ] * len(TRADE_COLUMNS))
     with get_conn() as conn:
         conn.executemany(f"INSERT INTO trades VALUES ({placeholders})", trades_list)
+
+
+def load_trades(username):
+    with get_conn() as conn:
+        df = pd.read_sql("SELECT * FROM trades WHERE user = ?", conn, params=(username,))
+    if not df.empty and 'trade_date' in df.columns:
+        df['trade_date'] = pd.to_datetime(df['trade_date'])
+    return df
 
 init_db()
 
@@ -107,7 +118,6 @@ if not st.session_state.user:
         else:
             pw_hash = hashlib.sha256(p.encode()).hexdigest()
             with get_conn() as conn:
-                # Insert the user if they don't exist yet
                 conn.execute("INSERT OR IGNORE INTO users (username, password) VALUES (?,?)", (u, pw_hash))
                 res = conn.execute("SELECT password FROM users WHERE username=?", (u,)).fetchone()
                 if res is None:
@@ -123,11 +133,7 @@ if not st.session_state.user:
     st.stop()
 
 # ---------------- DATA LOADING & HELPERS ----------------
-# load current user's trades
-conn = get_conn()
-df = pd.read_sql("SELECT * FROM trades WHERE user = ?", conn, params=(st.session_state.user,))
-if not df.empty and 'trade_date' in df.columns:
-    df['trade_date'] = pd.to_datetime(df['trade_date'])
+df = load_trades(st.session_state.user)
 
 def clean_currency(value):
     if isinstance(value, str):
@@ -167,41 +173,23 @@ if page == "Dashboard":
         c2.metric("Win Rate", f"{(df.pnl > 0).mean()*100:.1f}%")
         c3.metric("Avg R", f"{df.r_multiple.mean():.2f}")
         c4.metric("Trades", len(df))
-        st.line_chart(df.sort_values("trade_date").set_index("trade_date")['pnl'].cumsum())
+        st.line_chart(df.sort_values("trade_date").set_index("trade_date")["pnl"].cumsum())
 
 # ---------------- TOS IMPORT ----------------
 elif page == "TOS Import":
     st.header("ThinkOrSwim Import")
     file = st.file_uploader("Upload 'Trade History' CSV from TOS", type="csv")
     if file:
-        raw_tos = pd.read_csv(file)
         if st.button("Process & Save"):
-            parsed = []
-            # Grouping by Symbol and Date to combine executions
-            if 'Exec Time' not in raw_tos.columns or 'Symbol' not in raw_tos.columns or 'Net Cash' not in raw_tos.columns:
-                st.error("CSV doesn't look like a TOS 'Trade History' export. Expected columns like 'Exec Time', 'Symbol', 'Net Cash'.")
-            else:
-                raw_tos['Date'] = pd.to_datetime(raw_tos['Exec Time']).dt.date
-                for (symbol, t_date), group in raw_tos.groupby(['Symbol', 'Date']):
-                    pnl = group['Net Cash'].apply(clean_currency).sum()
-                    # Ensure qty exists and is numeric; fall back to 1 if not present
-                    qty_sum = 0
-                    if 'Qty' in group.columns:
-                        try:
-                            qty_sum = int(group['Qty'].abs().sum() / 2)
-                        except Exception:
-                            qty_sum = 1
-                    else:
-                        qty_sum = 1
-                    parsed.append((
-                        str(uuid.uuid4()), t_date.isoformat(), symbol, "TOS",
-                        qty_sum, 100.0, round(pnl, 2), round(pnl / 100, 2),
-                        "", "", "", "", "", st.session_state.user, "TOS Import", "Open", "Calm", 3
-                    ))
+            try:
+                parsed = parse_tos_csv(file, st.session_state.user)
                 if parsed:
                     bulk_save_trades(parsed)
                 st.success(f"Imported {len(parsed)} trades.")
                 st.balloons()
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Failed to parse file: {e}")
 
 # ---------------- ANALYTICS & HEATMAP ----------------
 elif page == "Analytics":
@@ -212,7 +200,6 @@ elif page == "Analytics":
         df['Day'] = df['trade_date'].dt.day_name()
         day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
         
-        # pivot on 'session' column, which matches the DB column name
         heatmap_data = df.pivot_table(index='session', columns='Day', values='pnl', aggfunc='sum').reindex(columns=day_order).fillna(0)
         
         fig, ax = plt.subplots(figsize=(10, 4))
@@ -264,11 +251,66 @@ elif page == "Add / Edit Trade":
             }
             save_trade(new_t, edit=False)
             st.success("Saved!")
+            st.experimental_rerun()
 
-# ---------------- ALL TRADES ----------------
+# ---------------- ALL TRADES (view / edit / delete) ----------------
 elif page == "All Trades":
     st.header("Trade History")
+    df = load_trades(st.session_state.user)
     if df.empty:
         st.info("No trades yet.")
     else:
         st.dataframe(df.sort_values("trade_date", ascending=False))
+        st.markdown("---")
+        st.subheader("Select a trade to edit or delete")
+        # selection label: include date, symbol, pnl for readability
+        def label_row(row):
+            return f"{row['trade_date'].date()} | {row['symbol']} | ${row['pnl']:.2f} | {row['id']}"
+        options = df.apply(label_row, axis=1).tolist()
+        selected = st.selectbox("Pick a trade", options)
+        if selected:
+            sel_id = selected.split(" | ")[-1]
+            row = df[df['id'] == sel_id].iloc[0]
+            with st.form("edit_form"):
+                d = st.date_input("Date", value=row['trade_date'].date())
+                s = st.text_input("Symbol", value=row['symbol']).upper()
+                p = st.number_input("P/L", value=float(row['pnl']))
+                r = st.number_input("Risk ($)", value=float(row['max_loss'] or 100.0))
+                size = st.number_input("Size", value=int(row['size'] or 1))
+                m = st.multiselect("Mistakes", MISTAKES, default=(row['mistakes'].split(",") if row['mistakes'] else []))
+                sess = st.selectbox("Session", SESSIONS, index=SESSIONS.index(row['session']) if row['session'] in SESSIONS else 0)
+                emo = st.selectbox("Emotion", EMOTIONS, index=EMOTIONS.index(row['emotion']) if row['emotion'] in EMOTIONS else 0)
+                review = st.text_area("Review Notes", value=row.get('review', ''))
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.form_submit_button("Save Changes"):
+                        r_mult = p / r if r > 0 else 0
+                        updated = {
+                            "id": sel_id,
+                            "trade_date": d.isoformat(),
+                            "symbol": s,
+                            "strategy": row.get('strategy', 'Manual'),
+                            "size": int(size),
+                            "max_loss": float(r),
+                            "pnl": float(p),
+                            "r_multiple": float(r_mult),
+                            "mistakes": ",".join(m),
+                            "thesis_entry": row.get('thesis_entry', '') or "",
+                            "thesis_exit": row.get('thesis_exit', '') or "",
+                            "review": review,
+                            "screenshot": row.get('screenshot', '') or "",
+                            "user": st.session_state.user,
+                            "setup": row.get('setup', '') or "",
+                            "session": sess,
+                            "emotion": emo,
+                            "quality": int(row.get('quality') or 3)
+                        }
+                        save_trade(updated, edit=True)
+                        st.success("Updated trade.")
+                        st.experimental_rerun()
+                with col2:
+                    if st.form_submit_button("Delete Trade"):
+                        with get_conn() as conn:
+                            conn.execute("DELETE FROM trades WHERE id=?", (sel_id,))
+                        st.success("Deleted trade.")
+                        st.experimental_rerun()
